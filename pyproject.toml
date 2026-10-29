@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyhydropannes"
-version = "0.1.0"
+version = "0.1.1"
 description = "Async client for Hydro-QuÃ©bec's Info-pannes outage service"
 readme = "README.md"
 license = "MIT"

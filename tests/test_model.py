@@ -504,3 +504,17 @@ def test_overlapping_outage_moves_start_back() -> None:
     assert h.active_outage.start == parse_datetime(earlier["dateDebut"])
     assert h.active_outage.end == parse_datetime(chosen["dateFin"])
     assert find(h, chosen).start == parse_datetime(chosen["dateDebut"])
+
+
+def test_interruption_id_and_probability() -> None:
+    intr = read(
+        {
+            "idInterruption": {"site": "A", "typeObjet": "I", "noInterruption": 12, "noSection": 1},
+            "probabilite": 0.75,
+        }
+    )
+    assert intr.id == "A-I-12-1"
+    assert intr.probability == 0.75
+    assert read({"idInterruption": {}, "probabilite": "x"}).id is None
+    assert read({"probabilite": "x"}).probability is None
+    assert read({"probabilite": True}).probability is None

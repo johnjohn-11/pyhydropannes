@@ -87,6 +87,24 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
+def _interruption_id(value: Any) -> str | None:
+    """Return a stable id built from the idInterruption object, None when it has no part."""
+    if not isinstance(value, Mapping):
+        return _code(value)
+    parts = [str(value.get(k, "")) for k in ("site", "typeObjet", "noInterruption", "noSection")]
+    return "-".join(parts) if any(parts) else None
+
+
+def _float(value: Any) -> float | None:
+    """Return a numeric field as a float, None when absent or not a number."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _now(now: datetime | None) -> datetime:
     return now if now is not None else datetime.now(UTC)
 
@@ -100,7 +118,7 @@ def _now(now: datetime | None) -> datetime:
 class Interruption:
     """One interruption listed in a payload.
 
-    ``start`` and ``end`` are the original window. A postponed or shifted planned interruption carries its new window in ``postponed_*`` or ``shifted_*``: use ``effective_start`` and ``effective_end``. ``raw`` is the interruption as the API sent it.
+    ``start`` and ``end`` are the original window. A postponed or shifted planned interruption carries its new window in ``postponed_*`` or ``shifted_*``: use ``effective_start`` and ``effective_end``. ``id`` joins the site, typeObjet, noInterruption and noSection of the API's idInterruption object. ``raw`` is the interruption as the API sent it.
     """
 
     raw: Mapping[str, Any] = field(repr=False, compare=False)
@@ -125,6 +143,7 @@ class Interruption:
     customers: int | None
     customers_in_other_outage: int | None
     planned_duration_minutes: int | None
+    probability: float | None
     gradual_restoration_possible: bool
 
     @classmethod
@@ -132,7 +151,7 @@ class Interruption:
         """Read one interruption of the payload."""
         return cls(
             raw=data,
-            id=_code(data.get("idInterruption")),
+            id=_interruption_id(data.get("idInterruption")),
             status=_code(data.get("etat")),
             planned=bool(data.get("interruptionPlanifiee", False)),
             start=parse_datetime(data.get("dateDebut")),
@@ -153,6 +172,7 @@ class Interruption:
             customers=_int(data.get("nbClient")),
             customers_in_other_outage=_int(data.get("nbClientsInclusDansAutrePanne")),
             planned_duration_minutes=_int(data.get("dureePrevu")),
+            probability=_float(data.get("probabilite")),
             gradual_restoration_possible=bool(data.get("repriseGraduellePossible")),
         )
 
