@@ -23,6 +23,7 @@ from pyhydropannes import (
     HydroPannesServerError,
     HydroPannesStatusError,
     HydroPannesTimeoutError,
+    ServiceStatus,
     normalize_postal_code,
 )
 from pyhydropannes import client as client_module
@@ -96,6 +97,13 @@ async def test_get_etat_returns_first_object(api: FakeApi, client: HydroPannesCl
     payload = make_payload()
     api.answers.append(_json([payload]))
     assert await client.async_get_payload(f" {LIEU} ") == payload
+
+
+async def test_get_state_reads_the_payload(api: FakeApi, client: HydroPannesClient) -> None:
+    api.answers.append(_json([make_payload(etat="A")]))
+    state = await client.async_get_state(LIEU)
+    assert state.location_id == LIEU
+    assert state.service_status is ServiceStatus.NO_OUTAGE
 
 
 @pytest.mark.parametrize("lieu", ["123", "abcdefghij", "12345678901"])

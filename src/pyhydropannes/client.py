@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime
 from types import TracebackType
 from typing import Any, Self
 
@@ -22,7 +23,7 @@ from .exceptions import (
     HydroPannesStatusError,
     HydroPannesTimeoutError,
 )
-from .model import Location
+from .model import Location, LocationState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -137,6 +138,10 @@ class HydroPannesClient:
             )
         payload: dict[str, Any] = body[0]
         return payload
+
+    async def async_get_state(self, location_id: str, now: datetime | None = None) -> LocationState:
+        """Return the state of a consumption location, read at ``now`` (the current time by default)."""
+        return LocationState.from_payload(await self.async_get_payload(location_id), now=now)
 
     async def async_search_locations(
         self, postal_code: str, civic_number: str, apartment: str = ""

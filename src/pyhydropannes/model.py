@@ -19,6 +19,8 @@ from .const import (
     CANCELLATION_REASON_DEFAULT,
     CANCELLATION_REASONS,
     EXPECTED_ROOT_FIELDS,
+    GRADUAL_RESTORATION_END_MARGIN,
+    GRADUAL_RESTORATION_PLANNED_MINUTES,
     KNOWN_INTERRUPTION_FIELDS,
     KNOWN_ROOT_FIELDS,
     MAJOR_URGENCY_CODES,
@@ -29,6 +31,20 @@ from .const import (
     PLANNED_SHIFTED,
     ROOT_OFF,
     ROOT_ON,
+)
+from .enums import (
+    CAUSE_CODES,
+    END_TYPE_CODES,
+    INTERVENTION_CODES,
+    INTERVENTION_CREW_DISPATCHED,
+    INTERVENTION_ON_SITE,
+    URGENCY_CODES,
+    Cause,
+    EndKind,
+    InterventionStep,
+    RestorationStep,
+    ServiceStatus,
+    UrgencyLevel,
 )
 
 HYDRO_QUEBEC_TZ = ZoneInfo("America/Toronto")
@@ -195,6 +211,21 @@ class Interruption:
         return self.urgency_code in MAJOR_URGENCY_CODES
 
     @property
+    def has_new_window(self) -> bool:
+        """Return True if the planned interruption was postponed or shifted (status "R" or "E")."""
+        return self.status in (PLANNED_POSTPONED, PLANNED_SHIFTED)
+
+    @property
+    def urgency(self) -> UrgencyLevel | None:
+        """Return the urgency level, None without a code or with one the site does not know."""
+        return URGENCY_CODES.get(self.urgency_code or "")
+
+    @property
+    def cause(self) -> Cause:
+        """Return the cause, undetermined without a code or with one the site does not map."""
+        return CAUSE_CODES.get(self.cause_code or "", Cause.UNDETERMINED)
+
+    @property
     def cancellation_reason(self) -> str | None:
         """Return the cancellation or postponement reason, None without a remark code."""
         if self.remark_code is None:
@@ -237,6 +268,62 @@ class Interruption:
         window = self._new_window
         end = window[1] if window else self.end
         return end is not None and end <= _now(now)
+
+    @property
+    def end_kind(self) -> EndKind | None:
+        """Return what ``display_end`` is, None when the interruption has neither an end nor an estimate."""
+        if self.has_new_window:
+            return EndKind.POSTPONED
+        if self.end:
+            return EndKind.ACTUAL
+        if self.estimated_end_max:
+            return EndKind.ESTIMATED
+        return None
+
+    @property
+    def display_end(self) -> datetime | None:
+        """Return the end to show: the end of the window in force, else the actual end, else the latest estimate."""
+        if self.has_new_window:
+            return self.effective_end
+        return self.end or self.estimated_end_max
+
+    @property
+    def estimated_end_earliest(self) -> datetime | None:
+        """Return the start of the estimated end range, when the end shown is an estimate given as a range."""
+        if self.end_kind is not EndKind.ESTIMATED:
+            return None
+        earliest, latest = self.estimated_end_min, self.estimated_end_max
+        return earliest if earliest and latest and earliest < latest else None
+
+    def elapsed(self, now: datetime | None = None) -> timedelta | None:
+        """Return how long the interruption has lasted, None before the start of its window in force.
+
+        Measured to the end of that window, or to ``now`` while it has none.
+        """
+        start = self.effective_start
+        now = _now(now)
+        if not start or start > now:
+            return None
+        return max((self.effective_end or now) - start, timedelta(0))
+
+    @property
+    def may_restore_gradually(self) -> bool:
+        """Return True when the planned duration is long enough for the site to warn about a gradual restoration."""
+        duration = self.planned_duration_minutes
+        return duration is not None and duration >= GRADUAL_RESTORATION_PLANNED_MINUTES
+
+    @property
+    def latest_end(self) -> datetime | None:
+        """Return the end of the window the site shows when the service may be restored gradually, None otherwise."""
+        end = self.effective_end
+        return end + GRADUAL_RESTORATION_END_MARGIN if end and self.may_restore_gradually else None
+
+    @property
+    def fallback_window(self) -> tuple[datetime, datetime | None] | None:
+        """Return the slot the site lists in case of postponement, None once postponed or without one."""
+        if self.is_postponed or not self.postponed_start:
+            return None
+        return self.postponed_start, self.postponed_end
 
     def is_future_planned(self, now: datetime | None = None) -> bool:
         """Return True if the interruption is a planned one with a future effective start."""
@@ -352,6 +439,138 @@ class LocationState:
         if intr is not None and intr.gradual_restoration_possible:
             return True
         return self.gradual_restoration_possible
+
+    # ----------------------------------------------------------------------
+    # What the site shows
+    # ----------------------------------------------------------------------
+
+    @property
+    def power_off(self) -> bool:
+        """Return True when the root status says the location is not fed."""
+        return self.status == ROOT_OFF
+
+    @property
+    def service_problem(self) -> bool:
+        """Return True when the location is not fed or an unplanned outage is under way.
+
+        The site shows an unplanned interruption under way as an outage even while the root status still says "A".
+        """
+        return self.power_off or self.active_outage is not None
+
+    @property
+    def has_ongoing_interruption(self) -> bool:
+        """Return True while an interruption is under way, when a caller may want to poll more often.
+
+        An unplanned interruption whose own status is under way counts whatever the root status. Otherwise the root status must be "N" with an interruption that has no end or one in the future.
+        """
+        if any(not i.planned and i.status in OUTAGE_ONGOING for i in self.interruptions):
+            return True
+        if not self.power_off:
+            return False
+        return any(i.end is None or i.end > self.now for i in self.interruptions)
+
+    @property
+    def _root_service_status(self) -> ServiceStatus | None:
+        if self.status == ROOT_ON:
+            return ServiceStatus.NO_OUTAGE
+        if self.status == ROOT_OFF:
+            return ServiceStatus.OUTAGE
+        return None
+
+    @property
+    def service_status(self) -> ServiceStatus | None:
+        """Return the overall status of the location, None when the root status is unknown and nothing tells otherwise."""
+        if not self.interruptions:
+            return self._root_service_status
+        if self.out_of_sync:
+            return ServiceStatus.OUTAGE
+
+        active = self.active_outage
+        if active:
+            if self.is_gradual_restoration(active):
+                return ServiceStatus.GRADUAL_RESTORATION
+            return ServiceStatus.MAJOR_OUTAGE if active.is_major else ServiceStatus.OUTAGE
+
+        planned = self.planned
+        if self.terminated_outage and not (planned and planned.supersedes_terminated(self.now)):
+            return ServiceStatus.RESTORED
+        if planned:
+            if planned.is_postponed:
+                return ServiceStatus.PLANNED_POSTPONED
+            if planned.is_cancelled:
+                return ServiceStatus.PLANNED_CANCELLED
+            if planned.is_terminated(self.now):
+                return ServiceStatus.PLANNED_TERMINATED
+            if self.power_off:
+                return ServiceStatus.PLANNED_IN_PROGRESS
+            return ServiceStatus.PLANNED_UPCOMING
+        return self._root_service_status
+
+    @property
+    def intervention_step(self) -> InterventionStep | None:
+        """Return the step the work on the current interruption has reached, None when the site shows none."""
+        intr = self.current
+        if not intr:
+            return None
+        # Checked before termination: the site shows a cancelled planned interruption as cancelled even once its slot is past.
+        if intr.planned and intr.is_cancelled:
+            return InterventionStep.PLANNED_CANCELLED
+        if intr.is_terminated(self.now):
+            return InterventionStep.RESTORED
+        if intr.is_postponed:
+            return InterventionStep.PLANNED_POSTPONED
+        if self.is_gradual_restoration(intr):
+            return InterventionStep.GRADUAL_RESTORATION
+        if self.is_planned_in_progress(intr):
+            # The site's planned-interruption tracker shows restoration as the current step once an end is known.
+            if intr.effective_end:
+                return InterventionStep.RESTORATION_EXPECTED
+            return InterventionStep.WORK_IN_PROGRESS
+        if intr.planned:
+            # Planned but not under way. The site shows no step for it.
+            return InterventionStep.PLANNED_UPCOMING
+        code = intr.intervention_code
+        if code == INTERVENTION_ON_SITE and intr.is_major:
+            return InterventionStep.WORK_BY_PRIORITY
+        if code in INTERVENTION_CODES:
+            return INTERVENTION_CODES[code]
+        return END_TYPE_CODES.get(intr.end_type_code or "")
+
+    @property
+    def restoration_step(self) -> RestorationStep | None:
+        """Return the restoration step of the site's tracker, None without an interruption under way.
+
+        The estimated end is rounded up to the quarter hour before being compared to now. Without an estimate, a crew on the way or on site means the time is being revised. The site also tests a typeFinPrevu field the API never sends (it sends typeFinPrevue), so that test never changes the outcome and is left out.
+        """
+        if self.out_of_sync:
+            return None
+        outage = self.active_outage
+        if not outage:
+            planned = self.planned
+            if planned and self.is_planned_in_progress(planned) and planned.effective_end:
+                # A planned interruption has a known end: the site shows it as expected, without revision.
+                return RestorationStep.EXPECTED
+            return None
+        estimate = outage.estimated_end_max
+        if estimate:
+            # Rounded in Hydro-Québec's time zone, as the site does in the visitor's.
+            if round_up_quarter(estimate.astimezone(HYDRO_QUEBEC_TZ)) <= self.now:
+                return RestorationStep.UNDER_REVISION
+            return RestorationStep.EXPECTED
+        if outage.intervention_code in INTERVENTION_CREW_DISPATCHED:
+            return RestorationStep.UNDER_REVISION
+        return RestorationStep.UNDER_ASSESSMENT
+
+    @property
+    def time_to_restoration(self) -> timedelta | None:
+        """Return the time left before the estimated end of the current interruption, None unless it is under way with an estimate still ahead."""
+        intr = self.current
+        if not intr or intr.is_terminated(self.now) or not self.is_active(intr):
+            return None
+        estimate = intr.estimated_end_max
+        if not estimate or estimate < self.now:
+            return None
+        return estimate - self.now
 
     # ----------------------------------------------------------------------
     # Selection, run once by from_payload()
